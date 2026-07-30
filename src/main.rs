@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, BorderType, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Terminal,
 };
 use crossterm::{
@@ -29,6 +29,7 @@ enum AppRequest {
     Fetch { repo: String, query: String },
     Close { repo: String, number: u32 },
     Reopen { repo: String, number: u32 },
+    Comment { repo: String, number: u32, body: String },
 }
 
 // Response from background worker thread
@@ -39,6 +40,16 @@ enum AppResponse {
     CloseError { number: u32, err: String },
     ReopenSuccess(u32),
     ReopenError { number: u32, err: String },
+    CommentSuccess(u32),
+    CommentError { number: u32, err: String },
+}
+
+#[derive(serde::Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct Comment {
+    author: Option<Author>,
+    body: String,
+    created_at: String,
 }
 
 // Struct representing a GitHub Issue deserialized from gh JSON output
@@ -48,10 +59,12 @@ struct Issue {
     number: u32,
     title: String,
     state: String,
-    author: Author,
+    author: Option<Author>,
     labels: Vec<Label>,
     updated_at: String,
     body: String,
+    #[serde(default)]
+    comments: Vec<Comment>,
 }
 
 #[derive(serde::Deserialize, Clone, Debug)]
@@ -235,6 +248,26 @@ fn truncate_str_by_width(s: &str, max_width: usize) -> String {
     result
 }
 
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
 // App state management
 struct App {
     repo: String,
@@ -242,7 +275,10 @@ struct App {
     list_state: ListState,
     search_query: String,
     search_focused: bool,
+    comment_focused: bool,
+    comment_buffer: String,
     details_scroll: usize,
+    comments_scroll: usize,
     status_log: String,
     is_loading: bool,
     closing_issues: std::collections::HashSet<u32>,
@@ -258,8 +294,11 @@ impl App {
             list_state: ListState::default(),
             search_query: String::new(),
             search_focused: false,
+            comment_focused: false,
+            comment_buffer: String::new(),
             details_scroll: 0,
-            status_log: String::from("Press '/' or click search to search. 'c' to close issues."),
+            comments_scroll: 0,
+            status_log: String::from("Press '/' or click search to search. 'c' to close, 'a' to comment."),
             is_loading: false,
             closing_issues: std::collections::HashSet::new(),
             reopening_issues: std::collections::HashSet::new(),
@@ -287,6 +326,7 @@ impl App {
         };
         self.list_state.select(Some(i));
         self.details_scroll = 0;
+        self.comments_scroll = 0;
     }
 
     fn select_prev(&mut self) {
@@ -305,6 +345,7 @@ impl App {
         };
         self.list_state.select(Some(i));
         self.details_scroll = 0;
+        self.comments_scroll = 0;
     }
 
     fn trigger_fetch(&mut self) {
@@ -357,6 +398,14 @@ impl App {
     }
 }
 
+fn clean_json_output(stdout: &[u8]) -> &[u8] {
+    if let Some(pos) = stdout.iter().position(|&b| b == b'{' || b == b'[') {
+        &stdout[pos..]
+    } else {
+        stdout
+    }
+}
+
 // Background thread worker loop
 fn run_backend_worker(req_rx: Receiver<AppRequest>, event_tx: Sender<Event>) {
     loop {
@@ -377,13 +426,13 @@ fn run_backend_worker(req_rx: Receiver<AppRequest>, event_tx: Sender<Event>) {
                                 "--repo",
                                 &repo,
                                 "--json",
-                                "number,title,state,author,labels,updatedAt,body",
+                                "number,title,state,author,labels,updatedAt,body,comments",
                             ])
                             .output();
                         match output {
                             Ok(out) => {
                                 if out.status.success() {
-                                    match serde_json::from_slice::<Issue>(&out.stdout) {
+                                    match serde_json::from_slice::<Issue>(clean_json_output(&out.stdout)) {
                                         Ok(issue) => {
                                             let _ = event_tx.send(Event::Backend(AppResponse::FetchSuccess(vec![issue])));
                                         }
@@ -408,7 +457,7 @@ fn run_backend_worker(req_rx: Receiver<AppRequest>, event_tx: Sender<Event>) {
                             "--repo",
                             &repo,
                             "--json",
-                            "number,title,state,author,labels,updatedAt,body",
+                            "number,title,state,author,labels,updatedAt,body,comments",
                             "--limit",
                             "1000",
                         ]);
@@ -418,7 +467,7 @@ fn run_backend_worker(req_rx: Receiver<AppRequest>, event_tx: Sender<Event>) {
                         match cmd.output() {
                             Ok(output) => {
                                 if output.status.success() {
-                                    match serde_json::from_slice::<Vec<Issue>>(&output.stdout) {
+                                    match serde_json::from_slice::<Vec<Issue>>(clean_json_output(&output.stdout)) {
                                         Ok(issues) => {
                                             let _ = event_tx.send(Event::Backend(AppResponse::FetchSuccess(issues)));
                                         }
@@ -470,6 +519,24 @@ fn run_backend_worker(req_rx: Receiver<AppRequest>, event_tx: Sender<Event>) {
                         }
                         Err(e) => {
                             let _ = event_tx.send(Event::Backend(AppResponse::ReopenError { number, err: e.to_string() }));
+                        }
+                    }
+                }
+                AppRequest::Comment { repo, number, body } => {
+                    let output = std::process::Command::new("gh")
+                        .args(&["issue", "comment", &number.to_string(), "--repo", &repo, "--body", &body])
+                        .output();
+                    match output {
+                        Ok(out) => {
+                            if out.status.success() {
+                                let _ = event_tx.send(Event::Backend(AppResponse::CommentSuccess(number)));
+                            } else {
+                                let err_str = String::from_utf8_lossy(&out.stderr).to_string();
+                                let _ = event_tx.send(Event::Backend(AppResponse::CommentError { number, err: err_str }));
+                            }
+                        }
+                        Err(e) => {
+                            let _ = event_tx.send(Event::Backend(AppResponse::CommentError { number, err: e.to_string() }));
                         }
                     }
                 }
@@ -537,6 +604,7 @@ fn main() -> io::Result<()> {
     let mut search_rect = Rect::default();
     let mut issues_list_rect = Rect::default();
     let mut details_rect = Rect::default();
+    let mut comments_rect = Rect::default();
 
     loop {
         // Draw TUI
@@ -599,15 +667,14 @@ fn main() -> io::Result<()> {
                 Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([
-                        Constraint::Percentage(40), // Issues List (Left)
-                        Constraint::Percentage(60), // Issue Details (Right)
+                        Constraint::Percentage(30), // Issues List (Left)
+                        Constraint::Percentage(70), // Issue Details (Right)
                     ])
                     .split(chunks[2])
             };
 
             // Issues List Column
             issues_list_rect = main_chunks[0];
-            details_rect = main_chunks[1];
             let list_block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -644,7 +711,8 @@ fn main() -> io::Result<()> {
                 let title_line = Line::from(title_spans);
 
                 // 2. Build and truncate metadata line
-                let meta_prefix = format!("    @{} updated {} ", issue.author.login, issue.updated_at.split('T').next().unwrap_or(""));
+                let author_name = issue.author.as_ref().map(|a| a.login.as_str()).unwrap_or("ghost");
+                let meta_prefix = format!("    @{} updated {} ", author_name, issue.updated_at.split('T').next().unwrap_or(""));
                 let prefix_width = meta_prefix.width();
                 
                 let mut meta_spans = vec![
@@ -688,7 +756,7 @@ fn main() -> io::Result<()> {
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(6), // Header details
-                    Constraint::Min(3),    // Body details
+                    Constraint::Min(3),    // Content details (body + comments)
                 ])
                 .split(main_chunks[1]);
 
@@ -704,7 +772,7 @@ fn main() -> io::Result<()> {
                     ]),
                     Line::from(vec![
                         Span::styled("Author: ", Style::default().fg(Color::Gray)),
-                        Span::styled(format!("@{}", issue.author.login), Style::default().fg(Color::White)),
+                        Span::styled(format!("@{}", issue.author.as_ref().map(|a| a.login.as_str()).unwrap_or("ghost")), Style::default().fg(Color::White)),
                         Span::styled("  |  Updated: ", Style::default().fg(Color::Gray)),
                         Span::styled(&issue.updated_at, Style::default().fg(Color::White)),
                     ]),
@@ -735,10 +803,22 @@ fn main() -> io::Result<()> {
                     .block(header_block);
                 f.render_widget(header_text, details_layout[0]);
 
+                let content_layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Ratio(2, 3), // Description
+                        Constraint::Ratio(1, 3), // Comments
+                    ])
+                    .split(details_layout[1]);
+
+                details_rect = content_layout[0];
+                comments_rect = content_layout[1];
+
                 let body_block = Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::DarkGray));
+                    .border_style(Style::default().fg(Color::DarkGray))
+                    .title(Span::styled(" Description ", Style::default().fg(Color::Gray)));
 
                 let cleaned_body = clean_github_markdown(&issue.body);
                 let core_markdown = tui_markdown::from_str(&cleaned_body);
@@ -746,7 +826,7 @@ fn main() -> io::Result<()> {
 
                 // Clamp scrolling
                 let total_lines = markdown_text.lines.len();
-                let display_height = details_layout[1].height.saturating_sub(2) as usize;
+                let display_height = content_layout[0].height.saturating_sub(2) as usize;
                 if app.details_scroll + display_height > total_lines && total_lines > display_height {
                     app.details_scroll = total_lines - display_height;
                 }
@@ -755,8 +835,55 @@ fn main() -> io::Result<()> {
                     .block(body_block)
                     .wrap(Wrap { trim: false })
                     .scroll((app.details_scroll as u16, 0));
-                f.render_widget(body_paragraph, details_layout[1]);
+                f.render_widget(body_paragraph, content_layout[0]);
+
+                // Render Comments Section
+                let comments_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::DarkGray))
+                    .title(Span::styled(format!(" Comments ({}) ", issue.comments.len()), Style::default().fg(Color::Gray)));
+
+                let mut comment_lines = Vec::new();
+                if issue.comments.is_empty() {
+                    comment_lines.push(Line::from(vec![
+                        Span::styled("No comments on this issue.", Style::default().fg(Color::DarkGray)),
+                    ]));
+                } else {
+                    for (idx, comment) in issue.comments.iter().enumerate() {
+                        let time_str = comment.created_at.split('T').next().unwrap_or("");
+                        let comment_author = comment.author.as_ref().map(|a| a.login.as_str()).unwrap_or("ghost");
+                        comment_lines.push(Line::from(vec![
+                            Span::styled(format!("@{}", comment_author), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                            Span::styled(format!(" commented on {}", time_str), Style::default().fg(Color::DarkGray)),
+                        ]));
+                        
+                        let cleaned_comment = clean_github_markdown(&comment.body);
+                        let core_comment_text = tui_markdown::from_str(&cleaned_comment);
+                        let converted_text = convert_text(core_comment_text);
+                        comment_lines.extend(converted_text.lines);
+                        
+                        if idx < issue.comments.len() - 1 {
+                            comment_lines.push(Line::from("─".repeat(content_layout[1].width.saturating_sub(2) as usize)));
+                        }
+                    }
+                }
+
+                // Clamp comments scroll
+                let total_comment_lines = comment_lines.len();
+                let display_comment_height = content_layout[1].height.saturating_sub(2) as usize;
+                if app.comments_scroll + display_comment_height > total_comment_lines && total_comment_lines > display_comment_height {
+                    app.comments_scroll = total_comment_lines - display_comment_height;
+                }
+
+                let scrolled_comments: Vec<Line> = comment_lines.into_iter().skip(app.comments_scroll).collect();
+                let comments_paragraph = Paragraph::new(scrolled_comments)
+                    .block(comments_block)
+                    .wrap(Wrap { trim: false });
+                f.render_widget(comments_paragraph, content_layout[1]);
             } else {
+                details_rect = main_chunks[1];
+                comments_rect = Rect::default();
                 let details_block = Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -770,6 +897,7 @@ fn main() -> io::Result<()> {
                     Line::from("  j / k       : Navigate issues list"),
                     Line::from("  c           : Close selected issue"),
                     Line::from("  r           : Reopen selected issue"),
+                    Line::from("  a           : Add comment to selected issue"),
                     Line::from("  R / F5      : Reload issues list"),
                     Line::from("  e           : Open issue in browser"),
                     Line::from("  /           : Focus Search Query input field"),
@@ -795,6 +923,8 @@ fn main() -> io::Result<()> {
                 Span::styled(" | ", Style::default().fg(Color::DarkGray)),
                 Span::styled(" r: ", Style::default().fg(Color::Green)), Span::styled("Reopen ", help_style),
                 Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+                Span::styled(" a: ", Style::default().fg(Color::Cyan)), Span::styled("Comment ", help_style),
+                Span::styled(" | ", Style::default().fg(Color::DarkGray)),
                 Span::styled(" e: ", Style::default().fg(Color::Yellow)), Span::styled("Open Web ", help_style),
                 Span::styled(" | ", Style::default().fg(Color::DarkGray)),
                 Span::styled(" /: ", Style::default().fg(Color::Cyan)), Span::styled("Search ", help_style),
@@ -806,6 +936,24 @@ fn main() -> io::Result<()> {
                 Span::styled(" q: ", Style::default().fg(Color::Red)), Span::styled("Quit ", help_style),
             ]);
             f.render_widget(Paragraph::new(help_spans).alignment(ratatui::layout::Alignment::Center), chunks[4]);
+
+            if app.comment_focused {
+                let area = centered_rect(70, 30, size);
+                let comment_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(Span::styled(" Write Comment (Enter: Submit | Esc: Cancel) ", Style::default().fg(Color::Gray)));
+                
+                let cursor_char = if (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() / 500) % 2 == 0 { "█" } else { " " };
+                let displayed_text = format!("{}{}", app.comment_buffer, cursor_char);
+                let comment_para = Paragraph::new(displayed_text)
+                    .block(comment_block)
+                    .wrap(Wrap { trim: false });
+                
+                f.render_widget(Clear, area);
+                f.render_widget(comment_para, area);
+            }
         })?;
 
         // Read event
@@ -817,7 +965,37 @@ fn main() -> io::Result<()> {
                 if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
                     continue;
                 }
-                if app.search_focused {
+                if app.comment_focused {
+                    match key.code {
+                        KeyCode::Enter => {
+                            if !app.comment_buffer.trim().is_empty() {
+                                if let Some(issue) = app.selected_issue() {
+                                    let num = issue.number;
+                                    app.is_loading = true;
+                                    app.status_log = format!("Posting comment to issue #{}...", num);
+                                    let _ = app.req_tx.send(AppRequest::Comment {
+                                        repo: app.repo.clone(),
+                                        number: num,
+                                        body: app.comment_buffer.clone(),
+                                    });
+                                }
+                            }
+                            app.comment_focused = false;
+                            app.comment_buffer.clear();
+                        }
+                        KeyCode::Esc => {
+                            app.comment_focused = false;
+                            app.comment_buffer.clear();
+                        }
+                        KeyCode::Backspace => {
+                            app.comment_buffer.pop();
+                        }
+                        KeyCode::Char(c) => {
+                            app.comment_buffer.push(c);
+                        }
+                        _ => {}
+                    }
+                } else if app.search_focused {
                     match key.code {
                         KeyCode::Enter => {
                             app.search_focused = false;
@@ -854,6 +1032,12 @@ fn main() -> io::Result<()> {
                         KeyCode::Char('K') => {
                             app.details_scroll = app.details_scroll.saturating_sub(2);
                         }
+                        KeyCode::Char('[') => {
+                            app.comments_scroll = app.comments_scroll.saturating_sub(2);
+                        }
+                        KeyCode::Char(']') => {
+                            app.comments_scroll = app.comments_scroll.saturating_add(2);
+                        }
                         KeyCode::PageDown => {
                             app.details_scroll = app.details_scroll.saturating_add(10);
                         }
@@ -871,6 +1055,13 @@ fn main() -> io::Result<()> {
                         }
                         KeyCode::Char('e') => {
                             app.trigger_web();
+                        }
+                        KeyCode::Char('a') => {
+                            if app.selected_issue().is_some() {
+                                app.comment_focused = true;
+                                app.comment_buffer.clear();
+                                app.status_log = String::from("Entering comment mode. Type comment and press Enter to post, Esc to cancel.");
+                            }
                         }
                         KeyCode::Esc => {
                             if !app.search_query.is_empty() {
@@ -907,8 +1098,12 @@ fn main() -> io::Result<()> {
                         }
                     }
                 } else if mouse.kind == MouseEventKind::ScrollDown {
-                    // Scroll issue details or list down based on hover bounds
-                    if mouse.row >= details_rect.y && mouse.row < details_rect.y + details_rect.height
+                    // Scroll issue details, comments, or list down based on hover bounds
+                    if mouse.row >= comments_rect.y && mouse.row < comments_rect.y + comments_rect.height
+                        && mouse.column >= comments_rect.x && mouse.column < comments_rect.x + comments_rect.width
+                    {
+                        app.comments_scroll = app.comments_scroll.saturating_add(2);
+                    } else if mouse.row >= details_rect.y && mouse.row < details_rect.y + details_rect.height
                         && mouse.column >= details_rect.x && mouse.column < details_rect.x + details_rect.width
                     {
                         app.details_scroll = app.details_scroll.saturating_add(2);
@@ -916,8 +1111,12 @@ fn main() -> io::Result<()> {
                         app.select_next();
                     }
                 } else if mouse.kind == MouseEventKind::ScrollUp {
-                    // Scroll issue details or list up based on hover bounds
-                    if mouse.row >= details_rect.y && mouse.row < details_rect.y + details_rect.height
+                    // Scroll issue details, comments, or list up based on hover bounds
+                    if mouse.row >= comments_rect.y && mouse.row < comments_rect.y + comments_rect.height
+                        && mouse.column >= comments_rect.x && mouse.column < comments_rect.x + comments_rect.width
+                    {
+                        app.comments_scroll = app.comments_scroll.saturating_sub(2);
+                    } else if mouse.row >= details_rect.y && mouse.row < details_rect.y + details_rect.height
                         && mouse.column >= details_rect.x && mouse.column < details_rect.x + details_rect.width
                     {
                         app.details_scroll = app.details_scroll.saturating_sub(2);
@@ -975,6 +1174,13 @@ fn main() -> io::Result<()> {
                     AppResponse::ReopenError { number, err } => {
                         app.reopening_issues.remove(&number);
                         app.status_log = format!("Failed to reopen #{}: {}", number, err);
+                    }
+                    AppResponse::CommentSuccess(num) => {
+                        app.status_log = format!("Comment added to issue #{} successfully.", num);
+                        app.trigger_fetch();
+                    }
+                    AppResponse::CommentError { number, err } => {
+                        app.status_log = format!("Failed to comment on issue #{}: {}", number, err);
                     }
                 }
             }
