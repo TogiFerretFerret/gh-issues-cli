@@ -363,38 +363,77 @@ fn run_backend_worker(req_rx: Receiver<AppRequest>, event_tx: Sender<Event>) {
         if let Ok(req) = req_rx.recv() {
             match req {
                 AppRequest::Fetch { repo, query } => {
-                    let mut cmd = std::process::Command::new("gh");
-                    cmd.args(&[
-                        "issue",
-                        "list",
-                        "--repo",
-                        &repo,
-                        "--json",
-                        "number,title,state,author,labels,updatedAt,body",
-                        "--limit",
-                        "1000",
-                    ]);
-                    if !query.is_empty() {
-                        cmd.args(&["-S", &query]);
-                    }
-                    match cmd.output() {
-                        Ok(output) => {
-                            if output.status.success() {
-                                match serde_json::from_slice::<Vec<Issue>>(&output.stdout) {
-                                    Ok(issues) => {
-                                        let _ = event_tx.send(Event::Backend(AppResponse::FetchSuccess(issues)));
+                    let query = query.trim();
+                    let is_number_query = (query.starts_with('#') && query[1..].chars().all(|c| c.is_digit(10)) && !query[1..].is_empty())
+                        || (query.chars().all(|c| c.is_digit(10)) && !query.is_empty());
+                    
+                    if is_number_query {
+                        let number_str = if query.starts_with('#') { &query[1..] } else { query };
+                        let output = std::process::Command::new("gh")
+                            .args(&[
+                                "issue",
+                                "view",
+                                number_str,
+                                "--repo",
+                                &repo,
+                                "--json",
+                                "number,title,state,author,labels,updatedAt,body",
+                            ])
+                            .output();
+                        match output {
+                            Ok(out) => {
+                                if out.status.success() {
+                                    match serde_json::from_slice::<Issue>(&out.stdout) {
+                                        Ok(issue) => {
+                                            let _ = event_tx.send(Event::Backend(AppResponse::FetchSuccess(vec![issue])));
+                                        }
+                                        Err(e) => {
+                                            let _ = event_tx.send(Event::Backend(AppResponse::FetchError(format!("Parse error: {}", e))));
+                                        }
                                     }
-                                    Err(e) => {
-                                        let _ = event_tx.send(Event::Backend(AppResponse::FetchError(format!("Parse error: {}", e))));
-                                    }
+                                } else {
+                                    // If not found, return empty list
+                                    let _ = event_tx.send(Event::Backend(AppResponse::FetchSuccess(Vec::new())));
                                 }
-                            } else {
-                                let err_str = String::from_utf8_lossy(&output.stderr).to_string();
-                                let _ = event_tx.send(Event::Backend(AppResponse::FetchError(err_str)));
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(Event::Backend(AppResponse::FetchError(e.to_string())));
                             }
                         }
-                        Err(e) => {
-                            let _ = event_tx.send(Event::Backend(AppResponse::FetchError(e.to_string())));
+                    } else {
+                        let mut cmd = std::process::Command::new("gh");
+                        cmd.args(&[
+                            "issue",
+                            "list",
+                            "--repo",
+                            &repo,
+                            "--json",
+                            "number,title,state,author,labels,updatedAt,body",
+                            "--limit",
+                            "1000",
+                        ]);
+                        if !query.is_empty() {
+                            cmd.args(&["-S", query]);
+                        }
+                        match cmd.output() {
+                            Ok(output) => {
+                                if output.status.success() {
+                                    match serde_json::from_slice::<Vec<Issue>>(&output.stdout) {
+                                        Ok(issues) => {
+                                            let _ = event_tx.send(Event::Backend(AppResponse::FetchSuccess(issues)));
+                                        }
+                                        Err(e) => {
+                                            let _ = event_tx.send(Event::Backend(AppResponse::FetchError(format!("Parse error: {}", e))));
+                                        }
+                                    }
+                                } else {
+                                    let err_str = String::from_utf8_lossy(&output.stderr).to_string();
+                                    let _ = event_tx.send(Event::Backend(AppResponse::FetchError(err_str)));
+                                }
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(Event::Backend(AppResponse::FetchError(e.to_string())));
+                            }
                         }
                     }
                 }
@@ -731,6 +770,7 @@ fn main() -> io::Result<()> {
                     Line::from("  j / k       : Navigate issues list"),
                     Line::from("  c           : Close selected issue"),
                     Line::from("  r           : Reopen selected issue"),
+                    Line::from("  R / F5      : Reload issues list"),
                     Line::from("  e           : Open issue in browser"),
                     Line::from("  /           : Focus Search Query input field"),
                     Line::from("  Esc         : Exit search input / Clear filter"),
@@ -760,6 +800,8 @@ fn main() -> io::Result<()> {
                 Span::styled(" /: ", Style::default().fg(Color::Cyan)), Span::styled("Search ", help_style),
                 Span::styled(" | ", Style::default().fg(Color::DarkGray)),
                 Span::styled(" Esc: ", Style::default().fg(Color::Gray)), Span::styled("Reset ", help_style),
+                Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+                Span::styled(" R/F5: ", Style::default().fg(Color::Cyan)), Span::styled("Reload ", help_style),
                 Span::styled(" | ", Style::default().fg(Color::DarkGray)),
                 Span::styled(" q: ", Style::default().fg(Color::Red)), Span::styled("Quit ", help_style),
             ]);
@@ -823,6 +865,9 @@ fn main() -> io::Result<()> {
                         }
                         KeyCode::Char('r') | KeyCode::Char('o') => {
                             app.trigger_reopen();
+                        }
+                        KeyCode::Char('R') | KeyCode::F(5) => {
+                            app.trigger_fetch();
                         }
                         KeyCode::Char('e') => {
                             app.trigger_web();
